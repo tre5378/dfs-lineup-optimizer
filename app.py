@@ -715,6 +715,22 @@ if projections_file_72 and salaries_file:
     df_projections_72.columns = df_projections_72.columns.str.strip()
     df_salaries.columns = df_salaries.columns.str.strip()
 
+    projection_name_col = None
+    projection_name_candidates = [
+        'Name',
+        'name',
+        'player_name',
+        'Player Name',
+        'dk_name',
+        'DK Name'
+    ]
+    for candidate in projection_name_candidates:
+        if candidate in df_projections_72.columns:
+            projection_name_col = candidate
+            break
+    if projection_name_col is None:
+        projection_name_col = df_projections_72.columns[0]
+
     df_salaries['merge_name'] = df_salaries['FName'] + ' ' + df_salaries['Name']
     manual_mappings = load_manual_mappings()
     df_projections_72['mapped_dk_name'] = df_projections_72['dk_name'].replace(manual_mappings)
@@ -723,33 +739,71 @@ if projections_file_72 and salaries_file:
     if cut_prob_file:
         df_cut_prob = pd.read_csv(cut_prob_file)
         df_cut_prob.columns = df_cut_prob.columns.str.strip()
-        
-        if 'player_name' not in df_cut_prob.columns:
-            st.error("Your 'Make Cut Probabilities' file is missing the required 'player_name' column.")
-            st.stop()
-        if 'make_cut' not in df_cut_prob.columns:
-            st.error("Your 'Make Cut Probabilities' file is missing the required 'make_cut' column.")
-            st.stop()
-        
-        df_cut_prob.rename(columns={'player_name': 'dk_name'}, inplace=True)
-        df_cut_prob['make_cut_raw'] = pd.to_numeric(df_cut_prob['make_cut'], errors='coerce')
-        df_cut_prob['make_cut'] = np.where(
-            df_cut_prob['make_cut_raw'] > 1,
-            1 / df_cut_prob['make_cut_raw'],
-            df_cut_prob['make_cut_raw']
-        )
-        df_cut_prob['make_cut'] = df_cut_prob['make_cut'].clip(lower=0, upper=1)
 
-        df_cut_prob['mapped_dk_name'] = df_cut_prob['dk_name'].replace(manual_mappings)
-        merged_df_72['name_key'] = merged_df_72['mapped_dk_name'].apply(normalize_name_key)
-        df_cut_prob['name_key'] = df_cut_prob['mapped_dk_name'].apply(normalize_name_key)
+        cut_name_candidates = [
+            'player_name',
+            'Player Name',
+            'Name',
+            'name',
+            'dk_name',
+            'DK Name'
+        ]
+        cut_odds_candidates = [
+            'make_cut',
+            'cut_odds',
+            'make_cut_odds',
+            'cut_prob',
+            'make_cut_prob'
+        ]
+        cut_name_col = next((col for col in cut_name_candidates if col in df_cut_prob.columns), None)
+        cut_odds_col = next((col for col in cut_odds_candidates if col in df_cut_prob.columns), None)
+
+        if cut_name_col is None:
+            st.error("Your 'Make Cut Probabilities' file is missing a player name column.")
+            st.stop()
+        if cut_odds_col is None:
+            st.error("Your 'Make Cut Probabilities' file is missing a cut odds/probability column.")
+            st.stop()
+
+        df_cut_prob['cut_odds_raw'] = pd.to_numeric(df_cut_prob[cut_odds_col], errors='coerce')
+        cut_odds_series = df_cut_prob['cut_odds_raw']
+        treat_as_odds = cut_odds_series.dropna().gt(1).any() or 'odds' in cut_odds_col.lower()
+        if treat_as_odds:
+            df_cut_prob['make_cut'] = (1 / cut_odds_series).clip(lower=0, upper=1)
+        else:
+            df_cut_prob['make_cut'] = cut_odds_series.clip(lower=0, upper=1)
+
+        merged_df_72['name_key'] = merged_df_72[projection_name_col].apply(normalize_name_key)
+        df_cut_prob['name_key'] = df_cut_prob[cut_name_col].apply(normalize_name_key)
         merged_df_72 = pd.merge(
             merged_df_72,
             df_cut_prob[['name_key', 'make_cut']],
             on="name_key",
             how="left"
         )
+        non_null_make_cut = merged_df_72['make_cut'].notna().sum()
         merged_df_72['make_cut'] = merged_df_72['make_cut'].fillna(0.65)
+        default_make_cut_count = (merged_df_72['make_cut'] == 0.65).sum()
+
+        if show_debug_panel:
+            st.subheader("Make-cut merge diagnostics")
+            st.write("Projections columns:", df_projections_72.columns.tolist())
+            st.write(df_projections_72.head(3))
+            st.write("Cut file columns:", df_cut_prob.columns.tolist())
+            st.write(df_cut_prob.head(3))
+            st.write(f"Projection rows: {len(df_projections_72)}")
+            st.write(f"Cut rows: {len(df_cut_prob)}")
+            st.write(f"Merged rows: {len(merged_df_72)}")
+            st.write(f"Merged make_cut non-null count: {non_null_make_cut}")
+            st.write(f"Merged make_cut default (0.65) count: {default_make_cut_count}")
+            st.write(
+                "Sample projection name_key values:",
+                merged_df_72['name_key'].dropna().unique()[:5]
+            )
+            st.write(
+                "Sample cut name_key values:",
+                df_cut_prob['name_key'].dropna().unique()[:5]
+            )
 
     if projections_file_18:
         df_projections_18 = pd.read_csv(projections_file_18)
@@ -795,10 +849,12 @@ if projections_file_72 and salaries_file:
                 total_rows = len(players_df_72)
                 make_cut_nan = players_df_72['make_cut'].isna().sum()
                 make_cut_zero = (players_df_72['make_cut'] == 0).sum()
+                match_rate = (players_df_72['make_cut'] != 0.65).mean()
                 st.subheader("Make-cut debug stats")
                 st.write(f"Total rows: {total_rows}")
                 st.write(f"Make-cut NaNs: {make_cut_nan}")
                 st.write(f"Make-cut zeros: {make_cut_zero}")
+                st.write(f"Match rate (make_cut != 0.65): {match_rate:.2%}")
                 st.write(
                     "Make-cut min/mean/max: "
                     f"{players_df_72['make_cut'].min():.3f} / "
