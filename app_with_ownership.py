@@ -425,11 +425,15 @@ def run_monte_carlo_simulation(players_df, assessed_lineups, std_col, prizes, en
         simulated_scores = {}
         for name, data in player_projections.items():
             if use_cut_model:
-                made_cut = np.random.rand() < data.get('make_cut', 0)
-                if made_cut:
-                    simulated_scores[name] = np.random.normal(loc=data['FPPG'], scale=data[std_col])
+                cut_probability = data.get('make_cut', 0)
+                mu_miss = 0.5 * data['FPPG']
+                if cut_probability > 0:
+                    mu_made = (data['FPPG'] - (1 - cut_probability) * mu_miss) / cut_probability
                 else:
-                    simulated_scores[name] = data['FPPG'] / 2 
+                    mu_made = mu_miss
+                made_cut = np.random.rand() < cut_probability
+                mu = mu_made if made_cut else mu_miss
+                simulated_scores[name] = np.random.normal(loc=mu, scale=data[std_col])
             else:
                 simulated_scores[name] = np.random.normal(loc=data['FPPG'], scale=data[std_col])
 
@@ -798,7 +802,7 @@ if projections_file_72 and salaries_file:
             
         df_cut_prob['mapped_dk_name'] = df_cut_prob['dk_name'].replace(manual_mappings)
         merged_df_72 = pd.merge(merged_df_72, df_cut_prob[['mapped_dk_name', 'make_cut']], on="mapped_dk_name", how="left")
-        merged_df_72['make_cut'].fillna(0, inplace=True)
+        merged_df_72['make_cut'].fillna(0.65, inplace=True)
 
     if projections_file_18:
         df_projections_18 = pd.read_csv(projections_file_18)
