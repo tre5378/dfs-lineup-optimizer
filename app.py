@@ -693,6 +693,7 @@ if 'simulation_results' not in st.session_state:
 
 st.sidebar.header("⚙️ Settings")
 st.sidebar.info("Upload your projections and salary files to begin.")
+show_debug_panel = st.sidebar.checkbox("Show debug panel", value=False)
 
 with st.sidebar.expander("File Uploads", expanded=True):
     projections_file_72 = st.file_uploader("72-Hole Projections", type="csv")
@@ -783,6 +784,47 @@ if projections_file_72 and salaries_file:
                 choices = [0.50, 0.65, 0.80]
                 players_df_72['std_multiplier'] = np.select(conditions, choices, default=0.65)
                 players_df_72['FPPG_std_18'] = players_df_72['FPPG'] * players_df_72['std_multiplier']
+
+            if show_debug_panel:
+                st.subheader("Simulation check (single golfer)")
+                golfer_options = players_df_72['display_name'].dropna().sort_values().tolist()
+                selected_golfer = st.selectbox("Select golfer", options=golfer_options)
+                selected_row = players_df_72.loc[players_df_72['display_name'] == selected_golfer].iloc[0]
+                fppg = float(selected_row['FPPG'])
+                make_cut_prob = float(selected_row['make_cut']) if 'make_cut' in players_df_72.columns else 0.0
+                std_col = 'FPPG_std_72' if 'FPPG_std_72' in players_df_72.columns else None
+                std_value = None
+                if std_col is not None:
+                    std_value = selected_row.get(std_col)
+                    if pd.isna(std_value):
+                        std_value = None
+
+                info_col1, info_col2 = st.columns(2)
+                info_col1.metric("FPPG", f"{fppg:.2f}")
+                info_col2.metric("Make-cut probability", f"{make_cut_prob:.2%}")
+
+                if std_value is None:
+                    std_value = st.number_input("Standard deviation", min_value=0.1, value=8.0, step=0.1)
+                else:
+                    st.write(f"Using standard deviation from {std_col}: {std_value:.2f}")
+
+                iterations = st.slider("Iterations", 1_000, 200_000, 20_000, step=1_000)
+                mu_miss = 0.5 * fppg
+                mu_made = (fppg - (1 - make_cut_prob) * mu_miss) / max(make_cut_prob, 1e-6)
+                rng = np.random.default_rng()
+                made_cut = rng.random(iterations) < make_cut_prob
+                scores = np.empty(iterations)
+                scores[made_cut] = rng.normal(mu_made, std_value, made_cut.sum())
+                scores[~made_cut] = rng.normal(mu_miss, 0.5 * std_value, (~made_cut).sum())
+                sim_mean = scores.mean()
+                p10, p50, p90 = np.percentile(scores, [10, 50, 90])
+
+                stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+                stat_col1.metric("Sim mean", f"{sim_mean:.2f}")
+                stat_col2.metric("P10", f"{p10:.2f}")
+                stat_col3.metric("P50", f"{p50:.2f}")
+                stat_col4.metric("P90", f"{p90:.2f}")
+                st.line_chart(pd.Series(np.sort(scores), name="Simulated score"))
 
             if merged_df_18 is not None:
                 players_df_18 = process_player_df(merged_df_18, 'scoring_points')
