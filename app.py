@@ -45,6 +45,11 @@ def load_discarded_players():
 def save_discarded_players(player_list):
     pd.DataFrame(player_list, columns=['player_name']).to_csv(DISCARDED_PLAYERS_FILE, index=False)
 
+def normalize_name_key(name):
+    if pd.isna(name):
+        return pd.NA
+    return " ".join(str(name).strip().lower().split())
+
 def process_player_df(merged_df, projection_col_name):
     required_base_cols = ['PlayerID', 'Price', 'dk_name', 'Position']
     required_cols = required_base_cols + [projection_col_name]
@@ -727,11 +732,24 @@ if projections_file_72 and salaries_file:
             st.stop()
         
         df_cut_prob.rename(columns={'player_name': 'dk_name'}, inplace=True)
-        df_cut_prob['make_cut'] = 1 / pd.to_numeric(df_cut_prob['make_cut'], errors='coerce')
-            
+        df_cut_prob['make_cut_raw'] = pd.to_numeric(df_cut_prob['make_cut'], errors='coerce')
+        df_cut_prob['make_cut'] = np.where(
+            df_cut_prob['make_cut_raw'] > 1,
+            1 / df_cut_prob['make_cut_raw'],
+            df_cut_prob['make_cut_raw']
+        )
+        df_cut_prob['make_cut'] = df_cut_prob['make_cut'].clip(lower=0, upper=1)
+
         df_cut_prob['mapped_dk_name'] = df_cut_prob['dk_name'].replace(manual_mappings)
-        merged_df_72 = pd.merge(merged_df_72, df_cut_prob[['mapped_dk_name', 'make_cut']], on="mapped_dk_name", how="left")
-        merged_df_72['make_cut'].fillna(0, inplace=True)
+        merged_df_72['name_key'] = merged_df_72['mapped_dk_name'].apply(normalize_name_key)
+        df_cut_prob['name_key'] = df_cut_prob['mapped_dk_name'].apply(normalize_name_key)
+        merged_df_72 = pd.merge(
+            merged_df_72,
+            df_cut_prob[['name_key', 'make_cut']],
+            on="name_key",
+            how="left"
+        )
+        merged_df_72['make_cut'] = merged_df_72['make_cut'].fillna(0.65)
 
     if projections_file_18:
         df_projections_18 = pd.read_csv(projections_file_18)
@@ -773,6 +791,24 @@ if projections_file_72 and salaries_file:
         players_df_72 = process_player_df(merged_df_72, 'total_points')
         
         if players_df_72 is not None:
+            if show_debug_panel and 'make_cut' in players_df_72.columns:
+                total_rows = len(players_df_72)
+                make_cut_nan = players_df_72['make_cut'].isna().sum()
+                make_cut_zero = (players_df_72['make_cut'] == 0).sum()
+                st.subheader("Make-cut debug stats")
+                st.write(f"Total rows: {total_rows}")
+                st.write(f"Make-cut NaNs: {make_cut_nan}")
+                st.write(f"Make-cut zeros: {make_cut_zero}")
+                st.write(
+                    "Make-cut min/mean/max: "
+                    f"{players_df_72['make_cut'].min():.3f} / "
+                    f"{players_df_72['make_cut'].mean():.3f} / "
+                    f"{players_df_72['make_cut'].max():.3f}"
+                )
+            elif show_debug_panel:
+                st.subheader("Make-cut debug stats")
+                st.write("No make_cut data available.")
+
             if 'std_dev' in players_df_72.columns:
                 st.info("Using 'std_dev' column from 72-hole file for simulations.")
                 players_df_72['FPPG_std_72'] = players_df_72['std_dev']
