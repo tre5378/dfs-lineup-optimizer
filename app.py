@@ -45,11 +45,6 @@ def load_discarded_players():
 def save_discarded_players(player_list):
     pd.DataFrame(player_list, columns=['player_name']).to_csv(DISCARDED_PLAYERS_FILE, index=False)
 
-def normalize_name_key(name):
-    if pd.isna(name):
-        return pd.NA
-    return " ".join(str(name).strip().lower().split())
-
 def process_player_df(merged_df, projection_col_name):
     required_base_cols = ['PlayerID', 'Price', 'dk_name', 'Position']
     required_cols = required_base_cols + [projection_col_name]
@@ -94,10 +89,12 @@ def process_player_df(merged_df, projection_col_name):
     return players_df
 
 # --- Core Optimizer Logic ---
-def run_optimizer(players_df, num_lineups, salary_cap, min_salary_filter, underdog_salary_filter, game_id, diversity, max_early, max_late, tee_time_cutoff, max_exposure, disregard_exposure_players):
+def run_optimizer(players_df, num_lineups, salary_cap, min_salary_filter, underdog_salary_filter, game_id, diversity, max_early, max_late, tee_time_cutoff, max_exposure, disregard_exposure_players, ownership_penalty_strength=0):
     """
     Runs a robust optimizer to generate the top N lineups, ensuring all players tee off before the specified time
     and respecting max exposure constraints, except for disregarded players.
+    
+    ownership_penalty_strength: 0-100 slider value. At 100, full tier penalties apply. At 0, no ownership adjustment.
     """
     # --- Constants ---
     NUM_PLAYERS_IN_LINEUP = 6
@@ -107,6 +104,25 @@ def run_optimizer(players_df, num_lineups, salary_cap, min_salary_filter, underd
     LOWEST_SALARY_FILTER_PRIMARY = 15.0
     LOWEST_SALARY_FILTER_SECONDARY = 14.5
     DIVERSITY_SCALING_FACTOR = 0.15
+    
+    # --- Ownership Penalty Tiers (based on DK ownership) ---
+    # Penalty multiplied by player's FPPG and subtracted from objective
+    # Tiers: >20% = Chalk, 10-20% = Popular, 5-10% = Moderate, <5% = Low-owned
+    OWNERSHIP_TIERS = {
+        'chalk': 0.15,      # >20% ownership - heavy penalty
+        'popular': 0.05,    # 10-20% ownership - slight penalty  
+        'moderate': 0.0,    # 5-10% ownership - neutral
+        'low': -0.03        # <5% ownership - slight boost (negative penalty)
+    }
+
+    # Captain-specific ownership penalty tiers (applied only to captain slot)
+    # More aggressive than general ownership penalty since captain concentration is the key edge
+    CAPTAIN_OWNERSHIP_TIERS = {
+        'chalk':    0.40,   # >15% captain owned - strong penalty
+        'popular':  0.15,   # 8-15% captain owned - moderate penalty
+        'moderate': 0.0,    # 3-8% captain owned - neutral
+        'low':     -0.10,   # <3% captain owned - boost (differential captain)
+    }
 
     # --- Tee Time Filter ---
     filtered_players_df = players_df.copy()
@@ -157,6 +173,74 @@ def run_optimizer(players_df, num_lineups, salary_cap, min_salary_filter, underd
         salaries[pos] = dict(zip(pos_players.Id, pos_players.Salary * 10))
         points[pos] = dict(zip(pos_players.Id, pos_players.FPPG))
 
+    # --- Ownership Penalty Setup ---
+    # Calculate penalty for each player based on their ownership tier
+    # Looks for 'projected_ownership' (DataGolf) or 'ownership' column
+    ownership_penalties = {}
+    ownership_col = None
+    if 'projected_ownership' in filtered_players_df.columns:
+        ownership_col = 'projected_ownership'
+    elif 'ownership' in filtered_players_df.columns:
+        ownership_col = 'ownership'
+    
+    has_ownership_data = ownership_col is not None
+    
+    if has_ownership_data and ownership_penalty_strength > 0:
+        penalty_scale = ownership_penalty_strength / 100.0  # Convert slider to 0-1 scale
+        
+        for _, row in filtered_players_df.iterrows():
+            pid = row['Id']
+            own_raw = row.get(ownership_col, 0)
+            # Handle both decimal (0.27) and percentage (27.0) formats
+            own = own_raw * 100 if own_raw <= 1 else own_raw
+            fppg = row['FPPG']
+            
+            # Assign tier based on ownership percentage
+            if own > 20:
+                tier_penalty = OWNERSHIP_TIERS['chalk']
+            elif own > 10:
+                tier_penalty = OWNERSHIP_TIERS['popular']
+            elif own > 5:
+                tier_penalty = OWNERSHIP_TIERS['moderate']
+            else:
+                tier_penalty = OWNERSHIP_TIERS['low']
+            
+            # Penalty = tier_penalty * fppg * scale (so it's relative to player's value)
+            ownership_penalties[pid] = tier_penalty * fppg * penalty_scale
+    else:
+        # No ownership data or penalty disabled - set all penalties to 0
+        for pid in filtered_players_df['Id']:
+            ownership_penalties[pid] = 0
+    
+    if has_ownership_data and ownership_penalty_strength > 0:
+        st.info(f"📊 Ownership penalty active (strength: {ownership_penalty_strength}%). Penalizing chalk, boosting low-owned.")
+
+    # --- Captain Ownership Penalty Setup ---
+    captain_ownership_penalties = {}
+    has_captain_data = 'predicted_captain_own' in filtered_players_df.columns
+
+    if has_captain_data and ownership_penalty_strength > 0:
+        penalty_scale = ownership_penalty_strength / 100.0
+        for _, row in filtered_players_df.iterrows():
+            pid = row['Id']
+            capt_raw = row.get('predicted_captain_own', 0) or 0
+            capt_own = capt_raw * 100 if capt_raw <= 1 else capt_raw
+            fppg = row['FPPG']
+
+            if capt_own > 15:
+                tier_penalty = CAPTAIN_OWNERSHIP_TIERS['chalk']
+            elif capt_own > 8:
+                tier_penalty = CAPTAIN_OWNERSHIP_TIERS['popular']
+            elif capt_own > 3:
+                tier_penalty = CAPTAIN_OWNERSHIP_TIERS['moderate']
+            else:
+                tier_penalty = CAPTAIN_OWNERSHIP_TIERS['low']
+
+            captain_ownership_penalties[pid] = tier_penalty * fppg * penalty_scale
+    else:
+        for pid in filtered_players_df['Id']:
+            captain_ownership_penalties[pid] = 0
+
     # --- Pre-flight check for feasibility ---
     all_salaries = [s for pos_salaries in salaries.values() for s in pos_salaries.values()]
     if len(all_salaries) < NUM_PLAYERS_IN_LINEUP:
@@ -178,10 +262,22 @@ def run_optimizer(players_df, num_lineups, salary_cap, min_salary_filter, underd
         player_vars = {k: LpVariable.dict(k, v, cat='Binary') for k, v in points.items()}
         captain_vars = {k: LpVariable.dict(f"is_captain_{k}", v, cat='Binary') for k, v in points.items()}
 
-        # Objective
+        # Objective (including ownership penalty)
         base_points_obj = lpSum(points[k][p_id] * player_vars[k][p_id] for k in player_vars for p_id in player_vars[k])
         captain_bonus_obj = lpSum(CAPTAIN_POINT_BONUS * points[k][p_id] * captain_vars[k][p_id] for k in captain_vars for p_id in captain_vars[k])
-        prob.setObjective(base_points_obj + captain_bonus_obj)
+        
+        # Ownership penalty: subtract penalty from objective (negative penalties = boost)
+        ownership_penalty_obj = lpSum(
+            ownership_penalties.get(p_id, 0) * player_vars[k][p_id] 
+            for k in player_vars for p_id in player_vars[k]
+        )
+        
+        # Captain ownership penalty: applied only when player is selected as captain
+        captain_own_penalty_obj = lpSum(
+            captain_ownership_penalties.get(p_id, 0) * captain_vars[k][p_id]
+            for k in captain_vars for p_id in captain_vars[k]
+        )
+        prob.setObjective(base_points_obj + captain_bonus_obj - ownership_penalty_obj - captain_own_penalty_obj)
 
         # Constraints
         total_cost = lpSum(salaries[k][p_id] * player_vars[k][p_id] for k in player_vars for p_id in player_vars[k])
@@ -238,9 +334,20 @@ def run_optimizer(players_df, num_lineups, salary_cap, min_salary_filter, underd
                         shock_std_dev = fppg * (diversity / 100) * DIVERSITY_SCALING_FACTOR
                         shock = np.random.normal(0, shock_std_dev)
                         shocked_points[pos][p_id] += shock
+            
+            # Recalculate objective with shocked points AND ownership penalty
+            shocked_ownership_penalty = lpSum(
+                ownership_penalties.get(p_id, 0) * player_vars[k][p_id] 
+                for k in player_vars for p_id in player_vars[k]
+            )
+            shocked_captain_own_penalty = lpSum(
+                captain_ownership_penalties.get(p_id, 0) * captain_vars[k][p_id]
+                for k in captain_vars for p_id in captain_vars[k]
+            )
             prob.setObjective(
                 lpSum(shocked_points[k][p_id] * player_vars[k][p_id] for k in player_vars for p_id in player_vars[k]) +
-                lpSum(CAPTAIN_POINT_BONUS * shocked_points[k][p_id] * captain_vars[k][p_id] for k in captain_vars for p_id in captain_vars[k])
+                lpSum(CAPTAIN_POINT_BONUS * shocked_points[k][p_id] * captain_vars[k][p_id] for k in captain_vars for p_id in captain_vars[k]) -
+                shocked_ownership_penalty - shocked_captain_own_penalty
             )
 
         prob.solve(PULP_CBC_CMD(msg=False))
@@ -662,6 +769,207 @@ def create_lineup_assessor_tab(players_df_72, players_df_18):
 
     build_and_assess_ui(players_df, contest_type, std_col, session_state_key, use_cut_model)
 
+
+# --- Results Tracker Functions ---
+RESULTS_FILE = 'results_tracker.csv'
+
+def load_results():
+    if os.path.exists(RESULTS_FILE):
+        return pd.read_csv(RESULTS_FILE)
+    return pd.DataFrame(columns=[
+        'date', 'tournament', 'contest', 'entry_fee', 
+        'score', 'finish', 'prize', 'captain', 'notes'
+    ])
+
+def save_result(entry: dict):
+    df = load_results()
+    new_row = pd.DataFrame([entry])
+    df = pd.concat([df, new_row], ignore_index=True)
+    df.to_csv(RESULTS_FILE, index=False)
+
+def create_results_tracker_tab():
+    st.header("Results Tracker")
+    
+    tab_log, tab_history, tab_summary = st.tabs(["Log Result", "History", "P&L Summary"])
+    
+    with tab_log:
+        st.subheader("Log a Contest Result")
+        st.info("Record your result immediately after each contest closes.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            tournament = st.text_input("Tournament", placeholder="e.g. Cognizant Classic")
+            contest = st.selectbox("Contest", ["£2", "£10"])
+            entry_fee = st.number_input("Entry Fee (£)", min_value=0.0, value=2.0, step=1.0)
+            score = st.number_input("Your Score", min_value=0.0, step=0.5)
+        with col2:
+            finish = st.number_input("Finishing Position", min_value=1, step=1)
+            prize = st.number_input("Prize Won (£)", min_value=0.0, step=0.5)
+            captain = st.text_input("Captain Used", placeholder="e.g. Scottie Scheffler")
+            notes = st.text_input("Notes (optional)", placeholder="e.g. high ownership week, faded Scheffler")
+        
+        date = st.date_input("Date")
+        
+        if st.button("💾 Save Result", type="primary"):
+            if not tournament:
+                st.warning("Please enter a tournament name.")
+            elif score == 0:
+                st.warning("Please enter your score.")
+            else:
+                save_result({
+                    'date': str(date),
+                    'tournament': tournament,
+                    'contest': contest,
+                    'entry_fee': entry_fee,
+                    'score': score,
+                    'finish': finish,
+                    'prize': prize,
+                    'profit': prize - entry_fee,
+                    'captain': captain,
+                    'notes': notes
+                })
+                st.success(f"✅ Result saved: {tournament} {contest} — Score {score}, Finish #{finish}, Prize £{prize:.2f}")
+                st.rerun()
+
+    with tab_history:
+        st.subheader("All Results")
+        df = load_results()
+        if df.empty:
+            st.info("No results logged yet. Use the Log Result tab after each contest.")
+        else:
+            df_display = df.copy()
+            if 'profit' not in df_display.columns:
+                df_display['profit'] = df_display['prize'] - df_display['entry_fee']
+            
+            def color_profit(val):
+                try:
+                    color = 'green' if float(val) > 0 else 'red' if float(val) < 0 else ''
+                    return f'color: {color}'
+                except:
+                    return ''
+            
+            st.dataframe(
+                df_display.style.applymap(color_profit, subset=['profit']).format({
+                    'entry_fee': '£{:.2f}',
+                    'prize': '£{:.2f}',
+                    'profit': '£{:.2f}',
+                }),
+                use_container_width=True,
+                hide_index=True
+            )
+            
+            if st.button("🗑️ Delete Last Entry"):
+                df = df.iloc[:-1]
+                df.to_csv(RESULTS_FILE, index=False)
+                st.success("Last entry deleted.")
+                st.rerun()
+
+    with tab_summary:
+        st.subheader("P&L Summary")
+        df = load_results()
+        if df.empty:
+            st.info("No results logged yet.")
+            return
+        
+        if 'profit' not in df.columns:
+            df['profit'] = df['prize'] - df['entry_fee']
+        
+        # Overall metrics
+        total_entries  = len(df)
+        total_staked   = df['entry_fee'].sum()
+        total_prizes   = df['prize'].sum()
+        total_profit   = df['profit'].sum()
+        roi            = (total_profit / total_staked * 100) if total_staked > 0 else 0
+        win_rate       = (df['prize'] > 0).mean() * 100
+        avg_finish     = df['finish'].mean()
+        
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Total Entries", total_entries)
+        col2.metric("Total Staked", f"£{total_staked:.2f}")
+        col3.metric("Total Prizes", f"£{total_prizes:.2f}")
+        profit_color = "normal" if total_profit == 0 else ("normal" if total_profit > 0 else "inverse")
+        col4.metric("Net P&L", f"£{total_profit:.2f}", delta=f"{roi:.1f}% ROI")
+        
+        st.divider()
+        
+        col5, col6 = st.columns(2)
+        col5.metric("Win Rate (any prize)", f"{win_rate:.1f}%")
+        col6.metric("Avg Finishing Position", f"#{avg_finish:.0f}")
+        
+        # By contest type
+        if df['contest'].nunique() > 1:
+            st.subheader("By Contest Type")
+            by_contest = df.groupby('contest').agg(
+                entries=('entry_fee', 'count'),
+                staked=('entry_fee', 'sum'),
+                prizes=('prize', 'sum'),
+                profit=('profit', 'sum'),
+                avg_finish=('finish', 'mean')
+            ).reset_index()
+            by_contest['roi'] = (by_contest['profit'] / by_contest['staked'] * 100).round(1)
+            
+            def color_profit(val):
+                try:
+                    color = 'green' if float(val) > 0 else 'red' if float(val) < 0 else ''
+                    return f'color: {color}'
+                except:
+                    return ''
+            
+            st.dataframe(
+                by_contest.style.applymap(color_profit, subset=['profit', 'roi']).format({
+                    'staked': '£{:.2f}', 'prizes': '£{:.2f}', 
+                    'profit': '£{:.2f}', 'roi': '{:.1f}%',
+                    'avg_finish': '#{:.0f}'
+                }),
+                use_container_width=True, hide_index=True
+            )
+        
+        # By tournament
+        st.subheader("By Tournament")
+        by_tourn = df.groupby('tournament').agg(
+            entries=('entry_fee', 'count'),
+            staked=('entry_fee', 'sum'),
+            prizes=('prize', 'sum'),
+            profit=('profit', 'sum'),
+            best_finish=('finish', 'min')
+        ).reset_index().sort_values('profit', ascending=False)
+        by_tourn['roi'] = (by_tourn['profit'] / by_tourn['staked'] * 100).round(1)
+        
+        st.dataframe(
+            by_tourn.style.applymap(color_profit, subset=['profit', 'roi']).format({
+                'staked': '£{:.2f}', 'prizes': '£{:.2f}',
+                'profit': '£{:.2f}', 'roi': '{:.1f}%',
+                'best_finish': '#{:.0f}'
+            }),
+            use_container_width=True, hide_index=True
+        )
+        
+        # Captain analysis
+        if df['captain'].notna().any() and (df['captain'] != '').any():
+            st.subheader("Captain Performance")
+            df_capt = df[df['captain'].notna() & (df['captain'] != '')]
+            by_captain = df_capt.groupby('captain').agg(
+                times_used=('captain', 'count'),
+                avg_score=('score', 'mean'),
+                avg_finish=('finish', 'mean'),
+                total_profit=('profit', 'sum')
+            ).reset_index().sort_values('avg_score', ascending=False)
+            
+            st.dataframe(
+                by_captain.style.applymap(color_profit, subset=['total_profit']).format({
+                    'avg_score': '{:.1f}', 'avg_finish': '#{:.0f}', 
+                    'total_profit': '£{:.2f}'
+                }),
+                use_container_width=True, hide_index=True
+            )
+        
+        # Running P&L chart
+        st.subheader("Running P&L")
+        df_sorted = df.sort_values('date').copy()
+        df_sorted['cumulative_profit'] = df_sorted['profit'].cumsum()
+        st.line_chart(df_sorted.set_index('date')['cumulative_profit'])
+
+
 # --- Main Streamlit User Interface ---
 st.set_page_config(page_title="DFS Optimizer", layout="wide")
 st.title("🚀 DFS Lineup Optimizer")
@@ -698,7 +1006,6 @@ if 'simulation_results' not in st.session_state:
 
 st.sidebar.header("⚙️ Settings")
 st.sidebar.info("Upload your projections and salary files to begin.")
-show_debug_panel = st.sidebar.checkbox("Show debug panel", value=False)
 
 with st.sidebar.expander("File Uploads", expanded=True):
     projections_file_72 = st.file_uploader("72-Hole Projections", type="csv")
@@ -715,22 +1022,6 @@ if projections_file_72 and salaries_file:
     df_projections_72.columns = df_projections_72.columns.str.strip()
     df_salaries.columns = df_salaries.columns.str.strip()
 
-    projection_name_col = None
-    projection_name_candidates = [
-        'Name',
-        'name',
-        'player_name',
-        'Player Name',
-        'dk_name',
-        'DK Name'
-    ]
-    for candidate in projection_name_candidates:
-        if candidate in df_projections_72.columns:
-            projection_name_col = candidate
-            break
-    if projection_name_col is None:
-        projection_name_col = df_projections_72.columns[0]
-
     df_salaries['merge_name'] = df_salaries['FName'] + ' ' + df_salaries['Name']
     manual_mappings = load_manual_mappings()
     df_projections_72['mapped_dk_name'] = df_projections_72['dk_name'].replace(manual_mappings)
@@ -739,71 +1030,20 @@ if projections_file_72 and salaries_file:
     if cut_prob_file:
         df_cut_prob = pd.read_csv(cut_prob_file)
         df_cut_prob.columns = df_cut_prob.columns.str.strip()
-
-        cut_name_candidates = [
-            'player_name',
-            'Player Name',
-            'Name',
-            'name',
-            'dk_name',
-            'DK Name'
-        ]
-        cut_odds_candidates = [
-            'make_cut',
-            'cut_odds',
-            'make_cut_odds',
-            'cut_prob',
-            'make_cut_prob'
-        ]
-        cut_name_col = next((col for col in cut_name_candidates if col in df_cut_prob.columns), None)
-        cut_odds_col = next((col for col in cut_odds_candidates if col in df_cut_prob.columns), None)
-
-        if cut_name_col is None:
-            st.error("Your 'Make Cut Probabilities' file is missing a player name column.")
+        
+        if 'player_name' not in df_cut_prob.columns:
+            st.error("Your 'Make Cut Probabilities' file is missing the required 'player_name' column.")
             st.stop()
-        if cut_odds_col is None:
-            st.error("Your 'Make Cut Probabilities' file is missing a cut odds/probability column.")
+        if 'make_cut' not in df_cut_prob.columns:
+            st.error("Your 'Make Cut Probabilities' file is missing the required 'make_cut' column.")
             st.stop()
-
-        df_cut_prob['cut_odds_raw'] = pd.to_numeric(df_cut_prob[cut_odds_col], errors='coerce')
-        cut_odds_series = df_cut_prob['cut_odds_raw']
-        treat_as_odds = cut_odds_series.dropna().gt(1).any() or 'odds' in cut_odds_col.lower()
-        if treat_as_odds:
-            df_cut_prob['make_cut'] = (1 / cut_odds_series).clip(lower=0, upper=1)
-        else:
-            df_cut_prob['make_cut'] = cut_odds_series.clip(lower=0, upper=1)
-
-        merged_df_72['name_key'] = merged_df_72[projection_name_col].apply(normalize_name_key)
-        df_cut_prob['name_key'] = df_cut_prob[cut_name_col].apply(normalize_name_key)
-        merged_df_72 = pd.merge(
-            merged_df_72,
-            df_cut_prob[['name_key', 'make_cut']],
-            on="name_key",
-            how="left"
-        )
-        non_null_make_cut = merged_df_72['make_cut'].notna().sum()
-        merged_df_72['make_cut'] = merged_df_72['make_cut'].fillna(0.65)
-        default_make_cut_count = (merged_df_72['make_cut'] == 0.65).sum()
-
-        if show_debug_panel:
-            st.subheader("Make-cut merge diagnostics")
-            st.write("Projections columns:", df_projections_72.columns.tolist())
-            st.write(df_projections_72.head(3))
-            st.write("Cut file columns:", df_cut_prob.columns.tolist())
-            st.write(df_cut_prob.head(3))
-            st.write(f"Projection rows: {len(df_projections_72)}")
-            st.write(f"Cut rows: {len(df_cut_prob)}")
-            st.write(f"Merged rows: {len(merged_df_72)}")
-            st.write(f"Merged make_cut non-null count: {non_null_make_cut}")
-            st.write(f"Merged make_cut default (0.65) count: {default_make_cut_count}")
-            st.write(
-                "Sample projection name_key values:",
-                merged_df_72['name_key'].dropna().unique()[:5]
-            )
-            st.write(
-                "Sample cut name_key values:",
-                df_cut_prob['name_key'].dropna().unique()[:5]
-            )
+        
+        df_cut_prob.rename(columns={'player_name': 'dk_name'}, inplace=True)
+        df_cut_prob['make_cut'] = 1 / pd.to_numeric(df_cut_prob['make_cut'], errors='coerce')
+            
+        df_cut_prob['mapped_dk_name'] = df_cut_prob['dk_name'].replace(manual_mappings)
+        merged_df_72 = pd.merge(merged_df_72, df_cut_prob[['mapped_dk_name', 'make_cut']], on="mapped_dk_name", how="left")
+        merged_df_72['make_cut'].fillna(0, inplace=True)
 
     if projections_file_18:
         df_projections_18 = pd.read_csv(projections_file_18)
@@ -845,26 +1085,6 @@ if projections_file_72 and salaries_file:
         players_df_72 = process_player_df(merged_df_72, 'total_points')
         
         if players_df_72 is not None:
-            if show_debug_panel and 'make_cut' in players_df_72.columns:
-                total_rows = len(players_df_72)
-                make_cut_nan = players_df_72['make_cut'].isna().sum()
-                make_cut_zero = (players_df_72['make_cut'] == 0).sum()
-                match_rate = (players_df_72['make_cut'] != 0.65).mean()
-                st.subheader("Make-cut debug stats")
-                st.write(f"Total rows: {total_rows}")
-                st.write(f"Make-cut NaNs: {make_cut_nan}")
-                st.write(f"Make-cut zeros: {make_cut_zero}")
-                st.write(f"Match rate (make_cut != 0.65): {match_rate:.2%}")
-                st.write(
-                    "Make-cut min/mean/max: "
-                    f"{players_df_72['make_cut'].min():.3f} / "
-                    f"{players_df_72['make_cut'].mean():.3f} / "
-                    f"{players_df_72['make_cut'].max():.3f}"
-                )
-            elif show_debug_panel:
-                st.subheader("Make-cut debug stats")
-                st.write("No make_cut data available.")
-
             if 'std_dev' in players_df_72.columns:
                 st.info("Using 'std_dev' column from 72-hole file for simulations.")
                 players_df_72['FPPG_std_72'] = players_df_72['std_dev']
@@ -876,47 +1096,6 @@ if projections_file_72 and salaries_file:
                 choices = [0.50, 0.65, 0.80]
                 players_df_72['std_multiplier'] = np.select(conditions, choices, default=0.65)
                 players_df_72['FPPG_std_18'] = players_df_72['FPPG'] * players_df_72['std_multiplier']
-
-            if show_debug_panel:
-                st.subheader("Simulation check (single golfer)")
-                golfer_options = players_df_72['display_name'].dropna().sort_values().tolist()
-                selected_golfer = st.selectbox("Select golfer", options=golfer_options)
-                selected_row = players_df_72.loc[players_df_72['display_name'] == selected_golfer].iloc[0]
-                fppg = float(selected_row['FPPG'])
-                make_cut_prob = float(selected_row['make_cut']) if 'make_cut' in players_df_72.columns else 0.0
-                std_col = 'FPPG_std_72' if 'FPPG_std_72' in players_df_72.columns else None
-                std_value = None
-                if std_col is not None:
-                    std_value = selected_row.get(std_col)
-                    if pd.isna(std_value):
-                        std_value = None
-
-                info_col1, info_col2 = st.columns(2)
-                info_col1.metric("FPPG", f"{fppg:.2f}")
-                info_col2.metric("Make-cut probability", f"{make_cut_prob:.2%}")
-
-                if std_value is None:
-                    std_value = st.number_input("Standard deviation", min_value=0.1, value=8.0, step=0.1)
-                else:
-                    st.write(f"Using standard deviation from {std_col}: {std_value:.2f}")
-
-                iterations = st.slider("Iterations", 1_000, 200_000, 20_000, step=1_000)
-                mu_miss = 0.5 * fppg
-                mu_made = (fppg - (1 - make_cut_prob) * mu_miss) / max(make_cut_prob, 1e-6)
-                rng = np.random.default_rng()
-                made_cut = rng.random(iterations) < make_cut_prob
-                scores = np.empty(iterations)
-                scores[made_cut] = rng.normal(mu_made, std_value, made_cut.sum())
-                scores[~made_cut] = rng.normal(mu_miss, 0.5 * std_value, (~made_cut).sum())
-                sim_mean = scores.mean()
-                p10, p50, p90 = np.percentile(scores, [10, 50, 90])
-
-                stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
-                stat_col1.metric("Sim mean", f"{sim_mean:.2f}")
-                stat_col2.metric("P10", f"{p10:.2f}")
-                stat_col3.metric("P50", f"{p50:.2f}")
-                stat_col4.metric("P90", f"{p90:.2f}")
-                st.line_chart(pd.Series(np.sort(scores), name="Simulated score"))
 
             if merged_df_18 is not None:
                 players_df_18 = process_player_df(merged_df_18, 'scoring_points')
@@ -931,13 +1110,15 @@ if projections_file_72 and salaries_file:
                     how='left'
                 )
             
-                col1, col2, col3, _ = st.columns([1, 1, 1, 4])
+                col1, col2, col3, col4, _ = st.columns([1, 1, 1, 1, 3])
                 if col1.button("Lineup Generator"):
                     st.session_state.active_tab = "Lineup Generator"
                 if col2.button("Lineup Assessor"):
                     st.session_state.active_tab = "Lineup Assessor"
                 if col3.button("Opponent Database"):
                     st.session_state.active_tab = "Opponent Database"
+                if col4.button("Results Tracker"):
+                    st.session_state.active_tab = "Results Tracker"
                 
                 st.divider()
 
@@ -972,6 +1153,13 @@ if projections_file_72 and salaries_file:
                     st.sidebar.header("🔍 Optional Filters")
                     min_salary_filter = st.sidebar.checkbox("Apply minimum total salary filter (>= £98.0)")
                     underdog_salary_filter = st.sidebar.checkbox("Apply underdog salary filter (>= £15.0)")
+                    st.sidebar.markdown("---")
+                    st.sidebar.header("📊 Ownership Leverage")
+                    ownership_penalty_strength = st.sidebar.slider(
+                        "Ownership Penalty Strength", 0, 100, 0,
+                        help="Penalize high-owned players and boost low-owned. Requires 'ownership' column in projections (from DataGolf DK ownership). 0 = off, 100 = full effect."
+                    )
+                    st.sidebar.caption("Tiers: >20% = Chalk (penalized), 10-20% = Popular (slight penalty), 5-10% = Neutral, <5% = Low-owned (boosted)")
                     
                     if st.button("🔥 Generate Lineups"):
                         if optimizer_type == "72-Hole Contest":
@@ -987,7 +1175,7 @@ if projections_file_72 and salaries_file:
                         with st.spinner("Optimizing..."):
                             scaled_salary_cap = salary_cap * 10
                             st.session_state[f'final_lineups{session_suffix}'], st.session_state[f'summary{session_suffix}'], st.session_state[f'upload{session_suffix}'] = run_optimizer(
-                                players_to_optimize, num_lineups, scaled_salary_cap, min_salary_filter, underdog_salary_filter, game_id, diversity, max_early, max_late, tee_time_cutoff, max_exposure, disregard_exposure_players
+                                players_to_optimize, num_lineups, scaled_salary_cap, min_salary_filter, underdog_salary_filter, game_id, diversity, max_early, max_late, tee_time_cutoff, max_exposure, disregard_exposure_players, ownership_penalty_strength
                             )
                             
                     session_suffix_display = "_72" if optimizer_type == "72-Hole Contest" else "_18"
@@ -1015,5 +1203,7 @@ if projections_file_72 and salaries_file:
 
                 elif st.session_state.active_tab == "Opponent Database":
                     create_opponent_database_tab()
+                elif st.session_state.active_tab == "Results Tracker":
+                    create_results_tracker_tab()
 else:
     st.info("👋 Welcome! Please upload your projection and salary files to begin.")
